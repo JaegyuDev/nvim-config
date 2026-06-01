@@ -1,3 +1,3 @@
-require("jaegyuDev")
-require("jaegyuDev.remap")
-require("jaegyuDev.lazy")
+-- require("jaegyuDev")
+-- require("jaegyuDev.remap")
+-- require("jaegyuDev.lazy")
