@@ -1,0 +1,253 @@
+From 1ec055629ebe9747d2d5a1bfc246d084442c1480 Mon Sep 17 00:00:00 2001
+From: JaegyuDev <JaegyuDev@users.noreply.github.com>
+Date: Mon, 1 Jun 2026 19:50:32 +0000
+Subject: [PATCH] nvim: migrate LSP off lsp-zero to native vim.lsp.config, add
+ Rust/Go
+
+Drop the lsp-zero abstraction in favour of Neovim 0.11's native LSP
+API (vim.lsp.config / vim.lsp.enable) and mason-lspconfig 2.0's
+automatic_enable.
+
+- init.lua: uncomment the module requires so the config actually loads
+- lazy.lua: replace lsp-zero + its dependency bundle with explicit
+  nvim-lspconfig, mason-org/mason{,-lspconfig}, and nvim-cmp specs
+- lsp.lua: rewrite to native API
+  - global capabilities via vim.lsp.config('*')
+  - explicit rust_analyzer (clippy + allFeatures) and gopls
+    (staticcheck + gofumpt) settings
+  - LspAttach autocmd for keymaps
+  - fix non-existent vim.lsp.buf.open_float/goto_next/goto_prev ->
+    vim.diagnostic.open_float/jump; correct ]d/[d direction
+  - set up nvim-cmp and fidget directly (previously handled by lsp-zero)
+
+Requires Neovim 0.11.3+. Run :Lazy sync && :Lazy clean afterwards.
+---
+ after/plugin/lsp.lua   | 138 +++++++++++++++++++++++++----------------
+ init.lua               |   6 +-
+ lua/jaegyuDev/lazy.lua |  27 +++++---
+ 3 files changed, 107 insertions(+), 64 deletions(-)
+
+diff --git a/after/plugin/lsp.lua b/after/plugin/lsp.lua
+index 7a6e805..8990a12 100644
+--- a/after/plugin/lsp.lua
++++ b/after/plugin/lsp.lua
+@@ -1,14 +1,42 @@
+-local lsp = require("lsp-zero")
++-- Completion capabilities broadcast to every server
++local capabilities = require('cmp_nvim_lsp').default_capabilities()
++vim.lsp.config('*', {
++    capabilities = capabilities,
++})
+ 
+-lsp.preset("recommended")
++-- Per-server config (extends nvim-lspconfig's lsp/<name>.lua defaults)
++vim.lsp.config('lua_ls', {
++    settings = {
++        Lua = {
++            runtime = { version = 'Lua 5.1' },
++            diagnostics = {
++                globals = { 'vim', 'it', 'describe', 'before_each', 'after_each' },
++            },
++        },
++    },
++})
+ 
+-local cmp_lsp = require("cmp_nvim_lsp")
+-local capabilities = vim.tbl_deep_extend(
+-    "force",
+-    {},
+-    vim.lsp.protocol.make_client_capabilities(),
+-    cmp_lsp.default_capabilities())
++vim.lsp.config('rust_analyzer', {
++    settings = {
++        ['rust-analyzer'] = {
++            cargo = { allFeatures = true },
++            check = { command = 'clippy' },
++        },
++    },
++})
+ 
++vim.lsp.config('gopls', {
++    settings = {
++        gopls = {
++            analyses = { unusedparams = true },
++            staticcheck = true,
++            gofumpt = true,
++        },
++    },
++})
++
++-- Install + auto-enable. nvim-lspconfig must be in runtimepath first (it is,
++-- since after/plugin runs once lazy has loaded start plugins).
+ require("mason").setup()
+ require("mason-lspconfig").setup({
+     ensure_installed = {
+@@ -17,58 +45,60 @@ require("mason-lspconfig").setup({
+         "gopls",
+         "jdtls",
+     },
+-    handlers = {
+-        function(server_name) -- default handler (optional)
++    -- automatic_enable = true is the default; installed servers get vim.lsp.enable()'d
++})
+ 
+-            require("lspconfig")[server_name].setup {
+-                capabilities = capabilities
+-            }
+-        end,
++-- Keymaps on attach
++vim.api.nvim_create_autocmd('LspAttach', {
++    callback = function(event)
++        local opts = { buffer = event.buf, remap = false }
+ 
+-        ["lua_ls"] = function()
+-            local lspconfig = require("lspconfig")
+-            lspconfig.lua_ls.setup {
+-                capabilities = capabilities,
+-                settings = {
+-                    Lua = {
+-                        runtime = { version = "Lua 5.1" },
+-                        diagnostics = {
+-                            globals = { "vim", "it", "describe", "before_each", "after_each" },
+-                        }
+-                    }
+-                }
+-            }
+-        end,
+-    }
++        vim.keymap.set('n', 'gd', function() vim.lsp.buf.definition() end, opts)
++        vim.keymap.set('n', 'K', function() vim.lsp.buf.hover() end, opts)
++        vim.keymap.set('n', '<leader>vws', function() vim.lsp.buf.workspace_symbol() end, opts)
++        vim.keymap.set('n', '<leader>vd', function() vim.diagnostic.open_float() end, opts)
++        vim.keymap.set('n', ']d', function() vim.diagnostic.jump({ count = 1, float = true }) end, opts)
++        vim.keymap.set('n', '[d', function() vim.diagnostic.jump({ count = -1, float = true }) end, opts)
++        vim.keymap.set('n', '<leader>vca', function() vim.lsp.buf.code_action() end, opts)
++        vim.keymap.set('n', '<leader>vrr', function() vim.lsp.buf.references() end, opts)
++        vim.keymap.set('n', '<leader>vrn', function() vim.lsp.buf.rename() end, opts)
++        vim.keymap.set('n', '<C-h>', function() vim.lsp.buf.signature_help() end, opts)
++    end,
+ })
+ 
++-- Completion
++require('fidget').setup({})
++
+ local cmp = require('cmp')
+-local cmp_select = {behavior = cmp.SelectBehavior.Select}
+-local cmp_mappings = lsp.defaults.cmp_mappings({
+-    ['<C-p>'] = cmp.mapping.select_prev_item(cmp_select),
+-    ['<C-n>'] = cmp.mapping.select_next_item(cmp_select),
+-    ['<C-y>'] = cmp.mapping.confirm({ select = true }),
+-    ['<C-Space>'] = cmp.mapping.complete(),
++local cmp_select = { behavior = cmp.SelectBehavior.Select }
+ 
++cmp.setup({
++    snippet = {
++        expand = function(args)
++            require('luasnip').lsp_expand(args.body)
++        end,
++    },
++    mapping = cmp.mapping.preset.insert({
++        ['<C-p>'] = cmp.mapping.select_prev_item(cmp_select),
++        ['<C-n>'] = cmp.mapping.select_next_item(cmp_select),
++        ['<C-y>'] = cmp.mapping.confirm({ select = true }),
++        ['<C-Space>'] = cmp.mapping.complete(),
++    }),
++    sources = cmp.config.sources({
++        { name = 'nvim_lsp' },
++        { name = 'luasnip' },
++    }, {
++        { name = 'buffer' },
++        { name = 'path' },
++    }),
+ })
+ 
+-lsp.set_preferences({
+-    --sign_icons = { }
++-- Use the otherwise-unused cmp-cmdline plugin
++cmp.setup.cmdline('/', {
++    mapping = cmp.mapping.preset.cmdline(),
++    sources = { { name = 'buffer' } },
++})
++cmp.setup.cmdline(':', {
++    mapping = cmp.mapping.preset.cmdline(),
++    sources = cmp.config.sources({ { name = 'path' } }, { { name = 'cmdline' } }),
+ })
+-
+-lsp.on_attach(function(client, bufnr)
+-    local opts = {buffer = bufnr, remap = false}
+-
+-    vim.keymap.set('n', 'gd', function() vim.lsp.buf.definition() end, opts)
+-    vim.keymap.set('n', 'K', function() vim.lsp.buf.hover() end, opts)
+-    vim.keymap.set('n', '<leader>vws', function() vim.lsp.buf.workspace_symbol() end, opts)
+-    vim.keymap.set('n', '<leader>vd', function() vim.lsp.buf.open_float() end, opts)
+-    vim.keymap.set('n', '[d', function() vim.lsp.buf.goto_next() end, opts)
+-    vim.keymap.set('n', ']d', function() vim.lsp.buf.goto_prev() end, opts)
+-    vim.keymap.set('n', '<leader>vca', function() vim.lsp.buf.code_action() end, opts)
+-    vim.keymap.set('n', '<leader>vrr', function() vim.lsp.buf.references() end, opts)
+-    vim.keymap.set('n', '<leader>vrn', function() vim.lsp.buf.rename() end, opts)
+-    vim.keymap.set('n', '<C-h>', function() vim.lsp.buf.signature_help() end, opts)
+-end)
+-
+-lsp.setup()
+diff --git a/init.lua b/init.lua
+index 2d1a64d..14a2087 100644
+--- a/init.lua
++++ b/init.lua
+@@ -1,3 +1,3 @@
+--- require("jaegyuDev")
+--- require("jaegyuDev.remap")
+--- require("jaegyuDev.lazy")
++require("jaegyuDev")
++require("jaegyuDev.remap")
++require("jaegyuDev.lazy")
+diff --git a/lua/jaegyuDev/lazy.lua b/lua/jaegyuDev/lazy.lua
+index e075e2c..ec287fc 100644
+--- a/lua/jaegyuDev/lazy.lua
++++ b/lua/jaegyuDev/lazy.lua
+@@ -31,23 +31,36 @@ require("lazy").setup({
+     --{
+     --    "theprimeagen/harpoon"
+     --},
++
++    -- LSP
++    {
++        'neovim/nvim-lspconfig'
++    },
++    {
++        "mason-org/mason.nvim",
++        opts = {}
++    },
+     {
+-        'VonHeikemen/lsp-zero.nvim',
+-        branch = 'v3.x',
++        "mason-org/mason-lspconfig.nvim",
++        dependencies = {
++            "mason-org/mason.nvim",
++            "neovim/nvim-lspconfig",
++        },
++    },
++
++    -- Completion
++    {
++        "hrsh7th/nvim-cmp",
+         dependencies = {
+-            "williamboman/mason.nvim",
+-            "williamboman/mason-lspconfig.nvim",
+             "hrsh7th/cmp-nvim-lsp",
+             "hrsh7th/cmp-buffer",
+             "hrsh7th/cmp-path",
+             "hrsh7th/cmp-cmdline",
+-            "hrsh7th/nvim-cmp",
+             "L3MON4D3/LuaSnip",
+             "saadparwaiz1/cmp_luasnip",
+-            "j-hui/fidget.nvim",
+         },
+     },
+     {
+-        'neovim/nvim-lspconfig'
++        "j-hui/fidget.nvim"
+     },
+ }, {})
+-- 
+2.43.0
+
