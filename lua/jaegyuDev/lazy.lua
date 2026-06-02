@@ -11,7 +11,9 @@ if not (vim.uv or vim.loop).fs_stat(lazypath) then
 end
 vim.opt.rtp:prepend(lazypath)
 
+
 require("lazy").setup({
+    { "L3MON4D3/LuaSnip", submodules = false },
     {
         "folke/tokyonight.nvim"
     },
